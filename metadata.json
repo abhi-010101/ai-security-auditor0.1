@@ -1,0 +1,5 @@
+{
+  "name": "UniGuard AI: University-Level Security Auditor",
+  "description": "An AI-powered, human-in-the-loop security platform for university Infosec teams, featuring isolated agents and a central reasoning brain for risk correlation.",
+  "requestFramePermissions": []
+}

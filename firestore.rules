@@ -1,0 +1,68 @@
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- HELPER FUNCTIONS ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isInfosec() {
+      return isSignedIn() && getUserData().role == 'infosec';
+    }
+    
+    function isAdmin() {
+      return isSignedIn() && getUserData().role == 'admin';
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // --- COLLECTION RULES ---
+
+    // USERS: Users can read own profile. Admins can manage all.
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isInfosec() || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // SCAN REQUESTS: Anyone can submit. Users read own. Infosec/Admin read all.
+    match /scan_requests/{requestId} {
+      allow create: if isSignedIn();
+      allow read: if isOwner(resource.data.created_by) || isInfosec() || isAdmin();
+      // NO UPDATE allowed by users. Only Cloud Functions (Admin SDK) update status.
+      allow update: if false; 
+    }
+
+    // AGENT REPORTS: Read-only for users (if own request). Write ONLY by Backend.
+    match /agent_reports/{reportId} {
+      allow read: if isOwner(resource.data.created_by) || isInfosec() || isAdmin();
+      allow write: if false; // Only Cloud Functions via Admin SDK
+    }
+
+    // ALERTS: Read by Infosec/Admin. Write ONLY by Backend.
+    match /alerts/{alertId} {
+      allow read: if isInfosec() || isAdmin();
+      allow update: if isInfosec() || isAdmin(); // For approval workflow
+      allow create: if false; // Only Cloud Functions
+    }
+
+    // LOGS: Read-only for Infosec/Admin. Write ONLY by Backend.
+    match /logs/{logId} {
+      allow read: if isInfosec() || isAdmin();
+      allow write: if false; // System generated only
+    }
+
+    // APPROVALS: Managed by Infosec
+    match /approvals/{approvalId} {
+      allow read, write: if isInfosec() || isAdmin();
+    }
+  }
+}
