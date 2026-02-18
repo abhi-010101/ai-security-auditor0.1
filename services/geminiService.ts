@@ -455,8 +455,8 @@ export async function runCentralBrainOrchestrator(
     
     TASK:
     1. Analyze the Risk Metrics provided.
-    2. Write an Executive Summary justifying the Health Score.
-    3. If Compound Threat is true, explain the specific escalation chain.
+    2. Write a VERY SIMPLE, NON-TECHNICAL Executive Summary (max 3 sentences) for a general user. Justify the Health Score in plain language. Do not use technical jargon like "CVSS", "MITRE", or specific exploit names unless absolutely necessary. Focus on whether it is safe or not.
+    3. If Compound Threat is true, explain broadly why.
     4. Determine if an ALERT is required (Status < 75 usually requires alert).
     5. Provide Global Severity based on the calculated risk.
   `;

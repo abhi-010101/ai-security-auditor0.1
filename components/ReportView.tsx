@@ -1,20 +1,72 @@
 
-import React from 'react';
-import { AgentReport, Alert, Severity, UserRole } from '../types';
-import { COLORS } from '../constants';
+import React, { useState, useEffect } from 'react';
+import { AgentReport, Alert, Severity, UserRole, ReportTier, AccessRequestStatus } from '../types';
+import { db } from '../services/firebase';
 
 interface ReportViewProps {
   report: AgentReport;
-  alert?: Alert;
+  alert?: Alert; // The alert associated with verification or access request
   role: UserRole;
   onBack: () => void;
   onApprove?: (alertId: string) => void;
-  onReject?: (alertId: string) => void;
+  onReject?: (alertId: string, reason?: string) => void;
 }
 
 const ReportView: React.FC<ReportViewProps> = ({ report, alert, role, onBack, onApprove, onReject }) => {
+  const [requestingAccess, setRequestingAccess] = useState(false);
+  const [requestingVerification, setRequestingVerification] = useState(false);
   
+  // OPTIMISTIC UI STATE
+  // These override the props temporarily to provide "instant" feedback
+  const [optimisticTier, setOptimisticTier] = useState<ReportTier | null>(null);
+  const [optimisticVerification, setOptimisticVerification] = useState<string | null>(null);
+
+  // Determine effective tier (Local override takes precedence for speed)
+  const displayTier = optimisticTier || report.reportTier;
+  
+  // Reset optimistic state if the actual report updates from DB to match or exceed
+  useEffect(() => {
+    if (report.reportTier === ReportTier.VERIFIED) setOptimisticTier(null);
+    if (report.reportTier === ReportTier.ADVANCED && optimisticTier === ReportTier.ADVANCED) setOptimisticTier(null);
+  }, [report.reportTier]);
+
+  // LOGIC: Who can see what?
+  const canSeeTechnical = role === UserRole.ADMIN || role === UserRole.INFOSEC || displayTier === ReportTier.ADVANCED || displayTier === ReportTier.VERIFIED;
+  const isVerified = displayTier === ReportTier.VERIFIED;
+  
+  // Verification Status Logic (Optimistic > Alert Prop)
+  const verificationStatus = optimisticVerification || alert?.status;
+
+  const handleRequestAdvanced = async () => {
+    setRequestingAccess(true);
+    
+    // 1. INSTANTLY update UI to show Advanced content
+    setOptimisticTier(ReportTier.ADVANCED);
+    
+    // 2. Perform DB update in background
+    await db.requestAdvancedReport(report.id as string);
+    
+    // 3. Reset loading spinner (content stays visible via optimisticTier)
+    setTimeout(() => setRequestingAccess(false), 500);
+  };
+
+  const handleRequestVerify = async () => {
+    setRequestingVerification(true);
+    
+    // 1. INSTANTLY update UI to show Pending status
+    setOptimisticVerification('pending_approval');
+    
+    // 2. Perform DB update
+    await db.requestVerification(report.id as string);
+    
+    setRequestingVerification(false);
+  };
+
   const handleDownloadPDF = () => {
+    if (!canSeeTechnical) {
+        window.alert("Detailed PDF is available only for Advanced Reports.");
+        return;
+    }
     const element = document.getElementById('printable-report');
     if (!element) return;
     const opt = {
@@ -25,315 +77,376 @@ const ReportView: React.FC<ReportViewProps> = ({ report, alert, role, onBack, on
       jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
     };
     const html2pdf = (window as any).html2pdf;
-    if (html2pdf) {
-        html2pdf().set(opt).from(element).save();
-    } else {
-        window.print();
-    }
+    if (html2pdf) html2pdf().set(opt).from(element).save();
+    else window.print();
   };
 
-  const severityColor = (sev: Severity) => {
-    switch (sev) {
-      case Severity.CRITICAL: return 'text-red-600 bg-red-50 border-red-200';
-      case Severity.HIGH: return 'text-orange-600 bg-orange-50 border-orange-200';
-      case Severity.MEDIUM: return 'text-indira-gold bg-amber-50 border-amber-200';
-      case Severity.LOW: return 'text-blue-600 bg-blue-50 border-blue-200';
-      default: return 'text-slate-600 bg-slate-50 border-slate-200';
+  // UPDATED SCORE LOGIC
+  const getStatusConfig = (score: number | undefined) => {
+    if (score === undefined) return { 
+        color: 'text-slate-400', 
+        label: 'ANALYZING', 
+        desc: 'Processing security metrics...', 
+        borderColor: 'border-slate-200',
+        bgColor: 'bg-slate-50',
+        iconColor: 'bg-slate-400'
+    };
+    
+    // SAFE: Above 60
+    if (score > 60) {
+        return {
+            color: 'text-emerald-600',
+            label: 'SAFE',
+            desc: 'This content appears safe. You can proceed.',
+            borderColor: 'border-emerald-500',
+            bgColor: 'bg-emerald-50',
+            iconColor: 'bg-emerald-500'
+        };
     }
+    // MAYBE: 46 - 60
+    if (score > 45) {
+        return {
+            color: 'text-amber-600',
+            label: 'UNCERTAIN',
+            desc: 'Potential risks detected. Proceed with care.',
+            borderColor: 'border-amber-500',
+            bgColor: 'bg-amber-50',
+            iconColor: 'bg-amber-500'
+        };
+    }
+    // UNSAFE: 0 - 45
+    return {
+        color: 'text-red-700',
+        label: 'UNSAFE',
+        desc: 'High risk detected. Do not use this content.',
+        borderColor: 'border-red-500',
+        bgColor: 'bg-red-50',
+        iconColor: 'bg-red-600'
+    };
   };
 
-  // Health Score Color Logic
-  const healthColor = (score: number | undefined) => {
-      if (score === undefined) return 'text-slate-400';
-      if (score >= 90) return 'text-emerald-500';
-      if (score >= 75) return 'text-emerald-600';
-      if (score >= 50) return 'text-amber-500';
-      return 'text-red-600';
-  };
+  const statusConfig = getStatusConfig(report.healthScore);
 
   return (
-    <div className="animate-in fade-in duration-300 pb-20 pt-8 px-8">
-      {/* ACTION BAR (Fixed) */}
-      <div className="flex justify-between items-center mb-8 no-print sticky top-0 bg-white/95 backdrop-blur z-50 py-4 border-b border-indira-border px-4 rounded-xl shadow-sm">
-        <button onClick={onBack} className="flex items-center gap-2 text-indira-navy hover:text-indira-brand font-black text-xs uppercase tracking-[0.2em] transition-all">
+    <div className="animate-in fade-in duration-300 pb-20 pt-4 md:pt-8 px-4 md:px-8">
+      {/* ACTION BAR */}
+      <div className="flex flex-col sm:flex-row justify-between items-center mb-6 md:mb-8 no-print sticky top-0 bg-white/95 backdrop-blur z-50 py-3 md:py-4 border-b border-indira-border px-4 rounded-xl shadow-sm gap-4">
+        <button onClick={onBack} className="flex items-center gap-2 text-indira-navy hover:text-indira-brand font-black text-[10px] md:text-xs uppercase tracking-[0.2em] transition-all">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
-            Exit Report
+            Back
         </button>
-        <div className="flex gap-4">
-            <button onClick={() => window.print()} className="bg-white border-2 border-indira-border text-indira-navy px-6 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-indira-subtle transition-all">
-                Print
-            </button>
-            <button onClick={handleDownloadPDF} className="bg-indira-navy text-white px-8 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-indira-brand transition-all flex items-center gap-2 shadow-xl shadow-indira-navy/20 border-2 border-indira-navy">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                Export PDF
-            </button>
+        <div className="flex gap-2 md:gap-4 w-full sm:w-auto">
+            {canSeeTechnical && (
+                 <>
+                    <button onClick={() => window.print()} className="flex-1 sm:flex-none bg-white border-2 border-indira-border text-indira-navy px-4 md:px-6 py-2 rounded-lg text-[9px] md:text-[10px] font-black uppercase tracking-widest hover:bg-indira-subtle">
+                        Print
+                    </button>
+                    <button onClick={handleDownloadPDF} className="flex-1 sm:flex-none bg-indira-navy text-white px-4 md:px-8 py-2 rounded-lg text-[9px] md:text-[10px] font-black uppercase tracking-widest hover:bg-indira-brand flex items-center justify-center gap-2 shadow-xl border-2 border-indira-navy">
+                        Export PDF
+                    </button>
+                 </>
+            )}
         </div>
       </div>
 
-      {/* REPORT CONTENT */}
-      <div id="printable-report" className="report-container bg-white max-w-5xl mx-auto shadow-2xl rounded-xl overflow-hidden border border-indira-border print:border-none print:shadow-none">
+      {/* REPORT CONTAINER */}
+      <div id="printable-report" className="report-container bg-white max-w-5xl mx-auto shadow-2xl rounded-xl overflow-hidden border border-indira-border print:border-none print:shadow-none relative">
         
-        {/* HEADER BLOCK */}
-        <header className="brand-gradient p-12 text-white relative">
-            <div className="absolute top-0 right-0 w-64 h-64 bg-white/5 rounded-full -mr-32 -mt-32 blur-3xl"></div>
-            <div className="relative z-10 flex justify-between items-end">
-                <div className="flex gap-8 items-center">
-                    <div className="w-20 h-20 bg-white rounded-2xl flex items-center justify-center shadow-2xl">
-                        <span className="logo-symbol text-5xl">I</span>
-                        <div className="w-3 h-3 bg-indira-gold rounded-full absolute top-4 right-4 shadow-lg"></div>
+        {/* VERIFIED SEAL (Stamp Style) */}
+        {isVerified && (
+            <div className="absolute top-8 right-8 md:top-10 md:right-12 z-30 pointer-events-none select-none animate-in zoom-in duration-500">
+                <div className="transform -rotate-[10deg] border-[6px] border-emerald-500 rounded-xl px-4 py-2 flex flex-col items-center justify-center bg-emerald-500/10 shadow-sm backdrop-blur-[1px] w-56 md:w-80 border-double">
+                     {/* Top Text */}
+                    <div className="flex items-center gap-2 md:gap-3 mb-1 border-b-2 border-emerald-500/40 pb-1 w-full justify-center">
+                        <svg className="w-3 h-3 md:w-4 md:h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                        <span className="text-emerald-700 text-[8px] md:text-[10px] font-black uppercase tracking-[0.3em]">Indira Audit</span>
+                    </div>
+                    
+                    {/* Main Text */}
+                    <h2 className="text-4xl md:text-6xl font-black text-emerald-500 uppercase tracking-tighter leading-none my-1" 
+                        style={{ fontFamily: 'Courier New, monospace', textShadow: '0 0 10px rgba(52, 211, 153, 0.2)' }}>
+                        VERIFIED
+                    </h2>
+                    
+                    {/* Bottom Metadata */}
+                    <div className="w-full border-t-2 border-emerald-500/40 mt-1 pt-1 flex justify-between items-center px-2">
+                         <span className="text-[8px] md:text-[10px] text-emerald-800 font-bold font-mono uppercase">{new Date(report.verifiedAt || Date.now()).toLocaleDateString()}</span>
+                         <span className="text-[8px] md:text-[10px] text-emerald-800 font-black uppercase tracking-widest">Infosec Department</span>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {/* HEADER */}
+        <header className={`brand-gradient p-6 md:p-12 text-white relative overflow-hidden transition-colors duration-500 ${isVerified ? 'bg-gradient-to-r from-emerald-950 to-indira-navy' : ''}`}>
+            {isVerified && <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-10"></div>}
+            
+            <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+                <div className="flex gap-4 md:gap-8 items-center">
+                    <div className="w-14 h-14 md:w-20 md:h-20 bg-white rounded-xl flex items-center justify-center shadow-2xl shrink-0">
+                        <span className="logo-symbol text-3xl md:text-5xl">I</span>
                     </div>
                     <div>
-                        <h1 className="uni-font text-5xl font-black tracking-tighter text-white mb-2">Security Audit Ledger</h1>
-                        <p className="text-indira-gold/90 text-xs font-black uppercase tracking-[0.5em] flex items-center gap-3">
-                            Indira University <span className="w-1 h-1 bg-white/20 rounded-full"></span> Internal Compliance Control
+                        <h1 className="uni-font text-2xl md:text-5xl font-black tracking-tighter text-white">
+                            {isVerified ? 'Official Audit Report' : 'Security Report'}
+                        </h1>
+                        <p className="text-indira-gold/90 text-[8px] md:text-[10px] font-black uppercase tracking-[0.3em] flex items-center gap-2">
+                            Indira University <span className="w-1 h-1 bg-white/20 rounded-full"></span> {displayTier} Level
                         </p>
                     </div>
                 </div>
-                <div className="text-right">
-                    <div className="bg-black/20 backdrop-blur-md px-6 py-3 rounded-2xl border border-white/10 text-right">
-                        <p className="text-[9px] text-indira-gold uppercase tracking-[0.3em] font-black mb-1">Authorization Token</p>
-                        <p className="font-mono text-lg font-black tracking-widest text-white">{report.scanRequestId.slice(-12).toUpperCase()}</p>
-                    </div>
+                <div className="bg-black/20 backdrop-blur-md px-4 md:px-6 py-2 md:py-3 rounded-xl border border-white/10 w-full md:w-auto text-center md:text-right">
+                    <p className="text-[8px] text-indira-gold uppercase tracking-[0.2em] font-black">Scan Reference</p>
+                    <p className="font-mono text-sm md:text-lg font-black tracking-widest text-white truncate">{report.scanRequestId.slice(-8).toUpperCase()}</p>
                 </div>
             </div>
         </header>
 
         {/* METADATA STRIP */}
-        <div className="bg-indira-subtle/80 border-b border-indira-border px-12 py-6 grid grid-cols-4 gap-8">
-            <div>
-                <span className="text-indira-gray font-black uppercase tracking-widest block mb-1 text-[9px]">Timestamp</span>
-                <span className="text-indira-navy font-bold text-sm">{new Date(report.created_at).toLocaleString()}</span>
+        <div className="bg-indira-subtle/80 border-b border-indira-border px-6 md:px-12 py-4 md:py-6 grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-8">
+            <div className="col-span-1">
+                <span className="text-indira-gray font-black uppercase tracking-widest block mb-1 text-[8px]">Generated On</span>
+                <span className="text-indira-navy font-bold text-[10px] md:text-sm">{new Date(report.created_at).toLocaleDateString()}</span>
             </div>
-            <div>
-                <span className="text-indira-gray font-black uppercase tracking-widest block mb-1 text-[9px]">Audit Engine</span>
-                <span className="text-indira-navy font-bold text-sm uppercase">{report.agentType.replace(/_/g, ' ')}</span>
+            <div className="col-span-1">
+                <span className="text-indira-gray font-black uppercase tracking-widest block mb-1 text-[8px]">Engine Type</span>
+                <span className="text-indira-navy font-bold text-[10px] md:text-sm uppercase">{report.agentType.split('_')[0]}</span>
             </div>
             <div className="col-span-2">
-                <span className="text-indira-gray font-black uppercase tracking-widest block mb-1 text-[9px]">Target Artifact / Identity</span>
-                <span className="text-indira-navy font-mono font-bold text-sm truncate block">{report.target || "N/A"}</span>
+                <span className="text-indira-gray font-black uppercase tracking-widest block mb-1 text-[8px]">Asset Target</span>
+                <span className="text-indira-navy font-mono font-bold text-[10px] md:text-sm truncate block">{report.target || "N/A"}</span>
             </div>
         </div>
 
-        <div className="p-12 space-y-16">
+        {/* CONTENT */}
+        <div className="p-6 md:p-12 space-y-12">
             
-            {/* BRAIN REASONING / EXECUTIVE SUMMARY */}
-            <section className="print-break-inside">
-                <div className="flex items-center gap-4 mb-8">
-                    <div className="w-10 h-10 rounded-xl bg-indira-navy flex items-center justify-center text-indira-gold shadow-lg">
-                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                    </div>
-                    <h2 className="text-xl font-black text-indira-navy uppercase tracking-tight">Post-Correlation Intelligence</h2>
-                </div>
-                
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
-                    <div className="lg:col-span-2 space-y-6">
-                        <div className="bg-white p-8 rounded-3xl border-2 border-indira-brand/10 shadow-sm relative group overflow-hidden">
-                            <div className="absolute top-0 left-0 w-1.5 h-full bg-indira-brand group-hover:w-2 transition-all"></div>
-                            <h3 className="text-[10px] font-black uppercase tracking-[0.3em] text-indira-brand mb-4">Central Brain Reasoning</h3>
-                            <p className="text-base text-slate-700 leading-relaxed font-semibold whitespace-pre-wrap">
-                                {report.summary}
-                            </p>
+            {/* LEVEL 1: EXECUTIVE SUMMARY (Always Visible) */}
+            <section className="space-y-6 md:space-y-10">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 md:gap-10">
+                    <div className="lg:col-span-2 space-y-4 md:space-y-6">
+                         {/* Status Label */}
+                        <div className={`p-6 rounded-xl border-l-4 ${statusConfig.bgColor} ${statusConfig.borderColor} ${statusConfig.color} flex items-start gap-4`}>
+                             <div className={`w-3 h-3 rounded-full mt-2 shrink-0 ${statusConfig.iconColor} animate-pulse`}></div>
+                             <div>
+                                <h3 className="text-2xl font-black uppercase tracking-tight mb-2">
+                                    STATUS: {statusConfig.label}
+                                </h3>
+                                <p className="text-sm font-bold opacity-90 leading-relaxed">
+                                    {statusConfig.desc}
+                                </p>
+                             </div>
                         </div>
-                        <div className="bg-indira-navy text-white p-8 rounded-3xl shadow-xl border border-indira-navy">
-                             <h3 className="text-[10px] font-black uppercase tracking-[0.3em] text-indira-gold mb-4">Strategic Impact Analysis</h3>
-                             <p className="text-sm text-slate-200 leading-relaxed font-medium">
-                                {report.reasoning}
-                             </p>
-                             {report.compoundThreat && (
-                                <div className="mt-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg flex items-center gap-3">
-                                    <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                                    <span className="text-[10px] font-black text-red-400 uppercase tracking-widest">Compound Threat Escalation Detected</span>
-                                </div>
-                             )}
+                        
+                        <div className="bg-white p-6 md:p-8 rounded-2xl border-2 border-slate-100 shadow-sm relative group overflow-hidden">
+                            <h3 className="text-[9px] font-black uppercase tracking-[0.3em] text-slate-400 mb-4">Executive Summary</h3>
+                            <p className="text-sm md:text-base text-slate-700 leading-relaxed font-medium whitespace-pre-wrap">{report.summary}</p>
                         </div>
                     </div>
-                    
-                    <div className="space-y-6">
-                        <div className="bg-white p-8 rounded-3xl border border-indira-border text-center shadow-sm">
-                            <p className="text-[10px] text-indira-gray uppercase tracking-widest font-black mb-4">System Health Score</p>
-                            <div className={`text-6xl font-black mb-2 ${healthColor(report.healthScore)}`}>
-                                {report.healthScore ?? '--'}
-                            </div>
-                            <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest">
-                                Risk Weight: {report.weightedRiskScore ?? 0}/100
-                            </p>
-                        </div>
 
-                        <div className="bg-indira-subtle/50 p-8 rounded-3xl border border-indira-border">
-                            <h4 className="text-[10px] font-black text-indira-navy uppercase tracking-widest mb-4">Integrity Metrics</h4>
-                            <div className="space-y-4">
-                                <div>
-                                    <div className="flex justify-between text-[10px] font-black uppercase mb-1">
-                                        <span className="text-indira-gray">Confidence Score</span>
-                                        <span className="text-indira-navy">92%</span>
-                                    </div>
-                                    <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                                        <div className="h-full bg-indira-brand w-[92%]"></div>
-                                    </div>
-                                </div>
-                                <div>
-                                    <div className="flex justify-between text-[10px] font-black uppercase mb-1">
-                                        <span className="text-indira-gray">False Positive Risk</span>
-                                        <span className="text-indira-navy">Low</span>
-                                    </div>
-                                    <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                                        <div className="h-full bg-emerald-500 w-[15%]"></div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
+                    <div className="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 text-center shadow-sm h-fit flex flex-col items-center justify-center">
+                        <p className="text-[9px] text-slate-400 uppercase tracking-widest font-black mb-4">Security Score</p>
+                        <div className={`text-6xl md:text-8xl font-black mb-2 ${statusConfig.color}`}>{report.healthScore ?? '--'}</div>
+                        <p className="text-[9px] text-slate-400 font-bold">OUT OF 100</p>
                     </div>
                 </div>
             </section>
 
-            {/* DETAILED FINDINGS */}
-            <section className="print-break-inside">
-                <div className="flex items-center justify-between mb-8 pb-4 border-b-2 border-indira-border">
-                    <div className="flex items-center gap-4">
-                        <div className="w-10 h-10 rounded-xl bg-indira-brand flex items-center justify-center text-white shadow-lg">
-                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+            {/* LEVEL 2 & 3: TECHNICAL FINDINGS (GATED) */}
+            <section className="relative pt-6 border-t border-slate-100">
+                <div className="flex items-center justify-between mb-6 md:mb-8">
+                    <h2 className="text-lg md:text-xl font-black text-indira-navy uppercase tracking-tight">Technical Audit Ledger</h2>
+                    {canSeeTechnical && (
+                        <div className="flex gap-2 animate-in fade-in zoom-in">
+                             {isVerified ? (
+                                <span className="bg-emerald-600 text-white px-3 py-1 rounded text-[8px] font-black uppercase tracking-widest shadow-md flex items-center gap-2">
+                                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>
+                                    Fully Verified
+                                </span>
+                             ) : (
+                                <span className="bg-indira-navy text-indira-gold px-3 py-1 rounded text-[8px] font-black uppercase tracking-widest">
+                                    Advanced Access
+                                </span>
+                             )}
                         </div>
-                        <h2 className="text-xl font-black text-indira-navy uppercase tracking-tight">Validated Technical Observations</h2>
-                    </div>
-                    <span className="bg-indira-navy text-white text-[10px] font-black px-4 py-1.5 rounded-full uppercase tracking-widest">
-                        {report.findings.length} Distinct Items
-                    </span>
+                    )}
                 </div>
-                
-                <div className="space-y-8">
-                    {report.findings.map((finding, idx) => (
-                        <div key={idx} className="bg-white border-2 border-slate-100 rounded-[32px] overflow-hidden hover:border-indira-brand/30 transition-all group shadow-sm print:break-inside-avoid">
-                            <div className="bg-slate-50/80 p-6 flex justify-between items-center border-b border-slate-100">
-                                <div className="flex items-center gap-6">
-                                    <span className="w-8 h-8 rounded-lg bg-indira-navy text-white flex items-center justify-center text-[10px] font-black font-mono">#{idx + 1}</span>
-                                    <div>
-                                        <h3 className="font-black text-indira-navy text-base tracking-tight">{finding.title}</h3>
-                                        <p className="text-[9px] text-indira-gray font-black uppercase tracking-[0.2em] mt-0.5">{finding.category || "Vulnerability Pattern"}</p>
-                                    </div>
+
+                {!canSeeTechnical ? (
+                    <div className="relative py-24 px-8 bg-slate-50 border border-slate-200 rounded-3xl text-center overflow-hidden">
+                        {/* Blur Filter overlay simulating hidden content */}
+                        <div className="absolute inset-0 bg-white/60 backdrop-blur-md z-10 flex flex-col items-center justify-center p-8">
+                            <div className="w-16 h-16 bg-indira-navy rounded-full flex items-center justify-center text-indira-gold text-2xl mb-6 shadow-xl">
+                                🔒
+                            </div>
+                            <h3 className="text-xl font-black text-indira-navy uppercase mb-2">Restricted Intelligence</h3>
+                            <p className="text-sm text-slate-600 font-medium max-w-md mb-8">
+                                Detailed vulnerabilities and technical remediation steps are restricted. 
+                                <br/>Unlock advanced access to view technical findings instantly.
+                            </p>
+                            
+                            <button 
+                                onClick={handleRequestAdvanced}
+                                disabled={requestingAccess}
+                                className="px-8 py-4 bg-indira-navy text-white font-black uppercase tracking-[0.2em] text-xs rounded-xl hover:bg-indira-brand transition-all shadow-xl hover:shadow-2xl active:scale-95 flex items-center gap-3"
+                            >
+                                {requestingAccess ? (
+                                    <>
+                                        <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Authorizing...
+                                    </>
+                                ) : (
+                                    'Unlock Advanced Details'
+                                )}
+                            </button>
+                        </div>
+                        
+                        {/* Fake Content underneath to look like blurred text */}
+                        <div className="space-y-6 opacity-30 filter blur-sm select-none pointer-events-none">
+                            {[1, 2, 3].map(i => (
+                                <div key={i} className="bg-white p-6 rounded-xl border border-slate-200">
+                                    <div className="h-4 w-3/4 bg-slate-300 rounded mb-4"></div>
+                                    <div className="h-2 w-full bg-slate-200 rounded mb-2"></div>
+                                    <div className="h-2 w-5/6 bg-slate-200 rounded"></div>
                                 </div>
-                                <div className="flex items-center gap-3">
-                                    {finding.cvss_score && (
-                                        <span className="px-3 py-1 bg-slate-800 text-white rounded font-mono text-[9px] font-bold">
-                                            CVSS {finding.cvss_score}
-                                        </span>
-                                    )}
-                                    <span className={`text-[9px] font-black uppercase px-4 py-1.5 rounded-full border-2 ${severityColor(finding.severity)}`}>
+                            ))}
+                        </div>
+                    </div>
+                ) : (
+                    <div className="space-y-6 md:space-y-8 animate-in slide-in-from-bottom-4">
+                         {/* Full Technical Findings */}
+                        {report.findings.map((finding, idx) => (
+                            <div key={idx} className="bg-white border-2 border-slate-100 rounded-3xl overflow-hidden hover:border-indira-brand/30 transition-all shadow-sm">
+                                <div className="bg-slate-50 p-4 md:p-6 flex flex-col sm:flex-row justify-between gap-3 border-b border-slate-100">
+                                    <h3 className="font-black text-indira-navy text-sm md:text-base uppercase tracking-tight">{finding.title}</h3>
+                                    <span className={`text-[8px] md:text-[9px] font-black uppercase px-3 py-1 rounded-full border-2 w-fit ${
+                                        finding.severity === Severity.CRITICAL ? 'text-red-600 bg-red-50 border-red-200' : 
+                                        finding.severity === Severity.HIGH ? 'text-orange-600 bg-orange-50 border-orange-200' :
+                                        finding.severity === Severity.MEDIUM ? 'text-amber-600 bg-amber-50 border-amber-200' :
+                                        'text-blue-600 bg-blue-50 border-blue-200'
+                                    }`}>
                                         {finding.severity}
                                     </span>
                                 </div>
-                            </div>
-                            
-                            <div className="p-8">
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-10 mb-8">
-                                    <div>
-                                        <h4 className="text-[9px] font-black uppercase text-indira-gray tracking-[0.3em] mb-3 flex items-center gap-2">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-slate-300"></span>
-                                            Technical Description
-                                        </h4>
-                                        <p className="text-sm text-slate-700 leading-relaxed font-semibold">{finding.description}</p>
-                                        
+                                <div className="p-4 md:p-8">
+                                    <p className="text-[11px] md:text-sm text-slate-700 leading-relaxed font-semibold mb-4">{finding.description}</p>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div className="bg-emerald-50 p-4 md:p-6 rounded-2xl border border-emerald-100">
+                                            <h4 className="text-[8px] md:text-[9px] font-black uppercase text-emerald-800 tracking-[0.2em] mb-2">Remediation Protocol</h4>
+                                            <p className="text-[10px] md:text-xs text-emerald-950 font-bold leading-relaxed">{finding.remediation}</p>
+                                        </div>
                                         {finding.cvss_vector && (
-                                            <div className="mt-4 p-3 bg-slate-50 border border-slate-100 rounded-lg font-mono text-[9px] text-slate-500 break-all">
-                                                <span className="font-bold text-indira-navy block mb-1">CVSS VECTOR:</span>
-                                                {finding.cvss_vector}
+                                            <div className="bg-slate-50 p-4 md:p-6 rounded-2xl border border-slate-100">
+                                                <h4 className="text-[8px] md:text-[9px] font-black uppercase text-slate-500 tracking-[0.2em] mb-2">CVSS v3.1 Metrics</h4>
+                                                <p className="text-[10px] md:text-xs font-mono text-slate-700 font-bold break-all">{finding.cvss_vector}</p>
+                                                <p className="text-2xl font-black text-indira-navy mt-2">{finding.cvss_score}</p>
                                             </div>
                                         )}
                                     </div>
-                                    <div>
-                                        <h4 className="text-[9px] font-black uppercase text-indira-gray tracking-[0.3em] mb-3 flex items-center gap-2">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-red-400"></span>
-                                            Potential Security Impact
-                                        </h4>
-                                        <p className="text-sm text-slate-700 leading-relaxed font-medium italic bg-red-50/30 p-4 rounded-2xl border border-red-100/30">
-                                            {finding.impact || "Exploitation could lead to unauthorized system access or data exfiltration."}
-                                        </p>
-                                    </div>
-                                </div>
-                                
-                                <div className="bg-emerald-50 p-8 rounded-[24px] border-2 border-emerald-100 relative group/rem">
-                                    <div className="absolute top-4 right-6 text-[9px] font-black text-emerald-800 uppercase tracking-widest opacity-30">Remediation Guide</div>
-                                    <h4 className="text-[9px] font-black uppercase text-emerald-800 tracking-[0.3em] mb-3 flex items-center gap-2">
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg>
-                                        Correction Protocol
-                                    </h4>
-                                    <p className="text-sm text-emerald-950 font-bold leading-relaxed">{finding.remediation}</p>
                                 </div>
                             </div>
-                        </div>
-                    ))}
-                </div>
-            </section>
+                        ))}
 
-            {/* AUDIT AUTHENTICATION */}
-            <section className="print-break-inside border-t-2 border-indira-border pt-12 mt-20">
-                 <div className="grid grid-cols-2 gap-20">
-                     <div className="space-y-6">
-                        <h4 className="text-[10px] font-black text-indira-navy uppercase tracking-[0.3em] mb-2">Certification & Status</h4>
-                        {alert?.status === 'approved' ? (
-                            <div className="border-2 border-emerald-200 bg-emerald-50/50 p-8 rounded-[32px] flex items-start gap-6">
-                                <div className="w-12 h-12 bg-emerald-600 rounded-full flex items-center justify-center text-white shadow-lg shrink-0">
-                                    <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>
+                         {/* VERIFICATION / AUDIT FOOTER */}
+                        {isVerified ? (
+                            <div className="mt-16 pt-12 border-t-4 border-double border-slate-200 print-break-inside-avoid">
+                                <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-12">
+                                    
+                                    {/* Left: Officer Signature */}
+                                    <div className="flex-1">
+                                        <p className="text-[9px] font-black uppercase text-slate-400 tracking-[0.2em] mb-6">Security Officer Authorization</p>
+                                        <div className="flex items-center gap-6">
+                                            <div className="relative">
+                                                <div className="w-20 h-20 border-2 border-indira-navy rounded-full flex items-center justify-center opacity-20"></div>
+                                                <div className="absolute inset-0 flex items-center justify-center">
+                                                    <span className="font-serif text-4xl text-indira-navy/40 font-bold italic">Signed</span>
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <p className="text-xl font-black text-indira-navy uppercase tracking-tight mb-1">{report.verifiedBy || 'Infosec Officer'}</p>
+                                                <p className="text-[10px] text-indira-brand font-black uppercase tracking-widest">Indira University Infosec Team</p>
+                                                <div className="h-0.5 w-32 bg-indira-navy mt-2"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Right: Timestamp & Hash */}
+                                    <div className="flex-1 md:text-right">
+                                        <div className="inline-block text-left md:text-right">
+                                            <p className="text-[9px] font-black uppercase text-slate-400 tracking-[0.2em] mb-2">Cryptographic Timestamp</p>
+                                            <p className="text-sm font-mono font-bold text-indira-navy mb-6 border-b border-slate-200 pb-2">
+                                                {report.verifiedAt ? new Date(report.verifiedAt).toLocaleDateString() : 'N/A'} &mdash; {report.verifiedAt ? new Date(report.verifiedAt).toLocaleTimeString() : 'N/A'}
+                                            </p>
+                                            
+                                            <p className="text-[9px] font-black uppercase text-slate-400 tracking-[0.2em] mb-2">Audit Reference Hash</p>
+                                            <p className="font-mono text-[10px] text-slate-500 bg-slate-50 px-3 py-2 rounded border border-slate-100">
+                                                {report.id}-{report.scanRequestId?.substring(0,8)}-VERIFIED
+                                            </p>
+                                        </div>
+                                    </div>
                                 </div>
-                                <div>
-                                    <p className="text-emerald-900 font-black text-sm uppercase tracking-tight mb-1">Audit Validated</p>
-                                    <p className="text-[10px] text-emerald-700 font-bold">Authenticated By: {alert.approvedBy || 'Senior Infosec Officer'}</p>
-                                    <p className="text-[10px] text-emerald-600/70 font-mono mt-2">{alert.approvedAt ? new Date(alert.approvedAt).toUTCString() : 'N/A'}</p>
+
+                                {/* Bottom Disclaimer */}
+                                <div className="mt-12 text-center">
+                                    <p className="text-[8px] text-slate-400 uppercase tracking-widest font-bold">
+                                        This document is an official security audit record of Indira University. 
+                                        <br/>Approved for release by the Information Security Department.
+                                    </p>
                                 </div>
                             </div>
                         ) : (
-                            <div className="border-2 border-amber-200 bg-amber-50/50 p-8 rounded-[32px] flex items-start gap-6">
-                                <div className="w-12 h-12 bg-amber-500 rounded-full flex items-center justify-center text-white shadow-lg shrink-0">
-                                    <svg className="w-7 h-7 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                </div>
-                                <div>
-                                    <p className="text-amber-900 font-black text-sm uppercase tracking-tight mb-1">Human Review Pending</p>
-                                    <p className="text-[10px] text-amber-700 font-bold tracking-wide">Awaiting Peer Authorization for University Ledger Publication.</p>
-                                </div>
+                            /* Verification Request moved to bottom of content */
+                            <div className="mt-12 py-10 px-6 border-t border-slate-200 bg-slate-50/50 rounded-xl flex flex-col items-center text-center">
+                                <h4 className="text-lg font-black text-indira-navy uppercase tracking-tight mb-2">Official Certification Required?</h4>
+                                <p className="text-xs text-slate-500 mb-6 max-w-lg leading-relaxed">
+                                    If this report is needed for official university compliance, grant applications, or external audits, 
+                                    you may request a formal review by the Information Security Department.
+                                </p>
+                                
+                                {verificationStatus === 'pending_approval' ? (
+                                    <div className="bg-amber-100 text-amber-800 px-6 py-3 rounded-lg font-black uppercase text-xs tracking-widest border border-amber-200 flex items-center gap-2 animate-in fade-in zoom-in">
+                                        <div className="w-2 h-2 bg-amber-600 rounded-full animate-pulse"></div>
+                                        Verification Pending Officer Review
+                                    </div>
+                                ) : verificationStatus === 'rejected' ? (
+                                    <div className="bg-red-50 text-red-700 px-8 py-4 rounded-xl font-black uppercase text-xs tracking-widest border-2 border-red-200 flex flex-col items-center gap-2 shadow-sm animate-in shake duration-500 max-w-xl">
+                                        <div className="flex items-center gap-2 mb-2">
+                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                            <span className="text-sm font-black">Verification Request Denied</span>
+                                        </div>
+                                        <span className="text-[9px] opacity-70 font-bold block mb-3">Infosec Rejected This Certification Request</span>
+                                        
+                                        {alert?.rejectionReason && (
+                                            <div className="w-full bg-white/60 p-3 rounded-lg text-left border border-red-100">
+                                                <span className="text-[7px] text-red-900 font-black uppercase tracking-widest block mb-1">Officer Note:</span>
+                                                <p className="text-[10px] md:text-xs font-medium leading-relaxed italic">
+                                                    "{alert.rejectionReason}"
+                                                </p>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <button 
+                                        onClick={handleRequestVerify}
+                                        disabled={requestingVerification}
+                                        className="bg-emerald-600 text-white px-8 py-3 rounded-xl font-black uppercase text-[10px] tracking-[0.2em] hover:bg-emerald-700 shadow-lg hover:shadow-emerald-500/20 transition-all active:scale-95 disabled:opacity-70 flex items-center gap-2"
+                                    >
+                                        {requestingVerification ? (
+                                            <>Processing Request...</>
+                                        ) : (
+                                            <>
+                                                Request Human Verification
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                            </>
+                                        )}
+                                    </button>
+                                )}
                             </div>
                         )}
-                     </div>
-                     <div className="text-right flex flex-col justify-end">
-                        <div className="mb-10">
-                            <h4 className="text-[10px] font-black text-indira-navy uppercase tracking-[0.3em] mb-4">Official Endorsement</h4>
-                            <div className="inline-block border-b-2 border-slate-300 w-64 h-12 relative">
-                                <div className="uni-font text-3xl text-indira-brand italic absolute bottom-0 left-0 opacity-40">UniGuard Core AI</div>
-                            </div>
-                            <p className="text-[9px] text-slate-400 font-bold mt-2 uppercase tracking-widest">Digital Auditor Signature</p>
-                        </div>
-                        <p className="text-[9px] text-slate-400 font-bold">This is a generated security audit document from the Indira University Secure Infrastructure. Redistribution of this document without proper authorization is strictly prohibited under Policy v2.4.</p>
-                     </div>
-                 </div>
+                    </div>
+                )}
             </section>
         </div>
-
-        {/* INFOSEC CONTROL PANEL (No Print) */}
-        {role === UserRole.INFOSEC && alert?.status === 'pending_approval' && (
-            <div className="brand-gradient p-10 no-print flex justify-between items-center rounded-b-xl">
-                <div className="text-white">
-                    <h4 className="font-black text-xl tracking-tight mb-1">Officer Intervention Required</h4>
-                    <p className="text-xs font-bold text-indira-gold/80 uppercase tracking-widest">Confirm findings to publish to global audit trail</p>
-                </div>
-                <div className="flex gap-6">
-                     <button 
-                        onClick={() => onReject && alert && onReject(alert.id)}
-                        className="bg-white/5 border-2 border-white/20 text-white hover:bg-red-500 hover:border-red-500 px-8 py-4 rounded-xl text-xs font-black uppercase tracking-[0.2em] transition-all"
-                     >
-                        Reject & Log
-                     </button>
-                     <button 
-                        onClick={() => onApprove && alert && onApprove(alert.id)}
-                        className="bg-indira-gold text-indira-navy px-12 py-4 rounded-xl text-xs font-black uppercase tracking-[0.2em] hover:bg-white hover:text-indira-brand transition-all shadow-2xl shadow-indira-gold/20"
-                     >
-                        Authorize Report
-                     </button>
-                </div>
-            </div>
-        )}
-      </div>
-      
-      {/* PRINT-ONLY FOOTER PAGE NUMBERS */}
-      <div className="hidden print:block fixed bottom-8 right-8 text-[10px] font-mono text-slate-400">
-          CONFIDENTIAL // IU-SOC-{report.scanRequestId.slice(-8).toUpperCase()}
       </div>
     </div>
   );

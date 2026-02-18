@@ -1,7 +1,8 @@
 
 import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, query, where, limit, setDoc, getDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
-import { AgentType, Severity, UserRole, User, UserStatus, Alert, AgentReport } from '../types';
+import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, query, where, limit, setDoc, getDoc, deleteDoc, onSnapshot, writeBatch } from 'firebase/firestore';
+import { getAuth, sendPasswordResetEmail } from 'firebase/auth';
+import { AgentType, Severity, UserRole, User, UserStatus, Alert, AgentReport, ReportTier, AccessRequestStatus } from '../types';
 import { runCentralBrainOrchestrator } from './geminiService';
 
 const firebaseConfig = {
@@ -15,19 +16,53 @@ const firebaseConfig = {
   measurementId: "G-49ZB99QNWC"
 };
 
-// Robust sanitization to prevent "Invalid nested entity" errors in Firestore
-// This uses JSON serialization to guarantee a pure object structure, stripping undefineds and converting complex types.
 function sanitizeData(obj: any): any {
-  return JSON.parse(JSON.stringify(obj, (key, value) => {
-    if (value === undefined) return undefined; // Remove undefined keys
-    if (typeof value === 'number' && isNaN(value)) return null; // Convert NaN to null
-    return value;
-  }));
+  const seen = new WeakMap();
+
+  function deepCopy(value: any): any {
+    // Primitives
+    if (value === null || typeof value !== 'object') {
+      if (value === undefined) return undefined;
+      if (typeof value === 'number' && isNaN(value)) return null;
+      return value;
+    }
+
+    // Dates
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+
+    // Cycle detection
+    if (seen.has(value)) {
+      return null;
+    }
+    seen.set(value, true);
+
+    // Arrays
+    if (Array.isArray(value)) {
+      return value.map(item => deepCopy(item)).filter(item => item !== undefined);
+    }
+
+    // Objects
+    const copy: any = {};
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        const processed = deepCopy(value[key]);
+        if (processed !== undefined) {
+          copy[key] = processed;
+        }
+      }
+    }
+    return copy;
+  }
+
+  return deepCopy(obj);
 }
 
 export class FirebaseService {
   private static instance: FirebaseService;
   private firestore: any;
+  private auth: any;
   private isMock: boolean = false;
   private activeUser: User | null = null;
   
@@ -51,10 +86,11 @@ export class FirebaseService {
 
   private saveMockDb(db: any) {
     try {
-        localStorage.setItem('uniguard_db', JSON.stringify(db));
+        const safeDb = sanitizeData(db);
+        localStorage.setItem('uniguard_db', JSON.stringify(safeDb));
         window.dispatchEvent(new Event('storage'));
     } catch (e) {
-        console.error("Local Storage Full", e);
+        console.error("Local Storage Save Failed", e);
     }
   }
 
@@ -62,6 +98,7 @@ export class FirebaseService {
     try {
         const app = initializeApp(firebaseConfig);
         this.firestore = getFirestore(app);
+        this.auth = getAuth(app);
         this.isMock = false;
         this.seedDemoUsers(); 
     } catch (e) {
@@ -111,10 +148,84 @@ export class FirebaseService {
     );
 
     if (found) {
+        if (found.status === UserStatus.DISABLED) {
+            throw new Error("ACCESS REVOKED: This account has been suspended by an administrator.");
+        }
         await this.setActiveUser(found);
         return found;
     }
     return null;
+  }
+
+  async socialLogin(provider: 'google' | 'microsoft' | 'phone'): Promise<User> {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    let userData;
+    if (provider === 'google') {
+        userData = {
+            name: 'Siddharth Gupta',
+            email: 'researcher.sid@indira.edu',
+            department: 'AI Research Lab',
+            role: UserRole.USER
+        };
+    } else if (provider === 'microsoft') {
+        userData = {
+            name: 'Dr. Anjali Desai',
+            email: 'prof.anjali@indira.edu',
+            department: 'Computer Science',
+            role: UserRole.USER 
+        };
+    } else {
+        userData = {
+            name: 'Vikram Singh',
+            email: 'vikram.ops@indira.edu',
+            department: 'Campus Security',
+            role: UserRole.USER
+        };
+    }
+
+    const users = await this.getUsers();
+    const existing = users.find(u => u.email === userData.email);
+    
+    if (existing) {
+        if (existing.status === UserStatus.DISABLED) {
+            throw new Error("ACCESS REVOKED: This account has been suspended by an administrator.");
+        }
+        await this.setActiveUser(existing);
+        return existing;
+    }
+
+    const uid = `u_${Date.now()}`;
+    const newUser: User = {
+        uid,
+        ...userData,
+        status: UserStatus.ACTIVE,
+        isOnline: true,
+        created_at: new Date().toISOString(),
+        created_by: 'sso_provider'
+    };
+    
+    if (this.isMock) {
+        const db = this.getMockDb();
+        db.users.push(newUser);
+        this.saveMockDb(db);
+    } else {
+        await setDoc(doc(this.firestore, 'users', uid), sanitizeData(newUser));
+    }
+    
+    this.activeUser = newUser;
+    return newUser;
+  }
+
+  async resetPassword(email: string): Promise<void> {
+      if (this.isMock) {
+          const db = this.getMockDb();
+          const user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+          if (!user) throw new Error("IDENTITY NOT FOUND: No record of this email in our security vault.");
+          return Promise.resolve();
+      } else {
+          await sendPasswordResetEmail(this.auth, email);
+      }
   }
 
   async register(userData: { name: string, email: string, password: string, department: string }): Promise<User> {
@@ -225,14 +336,6 @@ export class FirebaseService {
      return reports;
   }
 
-  async getAlerts(role: UserRole): Promise<Alert[]> {
-     if (this.isMock) {
-       return this.getMockDb().alerts;
-     }
-     const snap = await getDocs(collection(this.firestore, 'alerts'));
-     return snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as Alert));
-  }
-
   async addUser(userData: Partial<User>): Promise<void> {
     const uid = `u_${Date.now()}`;
     const newUser = {
@@ -267,20 +370,41 @@ export class FirebaseService {
 
   async deleteUser(uid: string): Promise<void> {
     if (!uid) return;
+
     if (this.isMock) {
       const db = this.getMockDb();
       db.users = db.users.filter(u => u.uid !== uid);
+      const reportIdsToDelete = db.agent_reports.filter(r => r.created_by === uid).map(r => r.id);
+      db.agent_reports = db.agent_reports.filter(r => r.created_by !== uid);
+      db.scan_requests = db.scan_requests.filter(s => s.created_by !== uid);
+      db.alerts = db.alerts.filter(a => !reportIdsToDelete.includes(a.reportId));
+      if (db.malware_analysis) db.malware_analysis = db.malware_analysis.filter(m => m.user_id !== uid);
       this.saveMockDb(db);
     } else {
-      await deleteDoc(doc(this.firestore, 'users', uid));
+      const batch = writeBatch(this.firestore);
+      batch.delete(doc(this.firestore, 'users', uid));
+      const collections = ['scan_requests', 'agent_reports', 'malware_analysis'];
+      for (const collName of collections) {
+          const qField = collName === 'malware_analysis' ? 'user_id' : 'created_by';
+          const q = query(collection(this.firestore, collName), where(qField, '==', uid));
+          const snap = await getDocs(q);
+          if (collName === 'agent_reports') {
+              for (const reportDoc of snap.docs) {
+                  const aq = query(collection(this.firestore, 'alerts'), where('reportId', '==', reportDoc.id));
+                  const asnap = await getDocs(aq);
+                  asnap.forEach(adoc => batch.delete(adoc.ref));
+                  batch.delete(reportDoc.ref);
+              }
+          } else {
+              snap.forEach(d => batch.delete(d.ref));
+          }
+      }
+      await batch.commit();
     }
   }
 
   async createScanRequest(request: { target: string, agentType: AgentType, fileMetadata?: any }): Promise<string> {
     const user = this.activeUser;
-    
-    // Explicitly destructure metadata and DEFAULT all fields to ensure no undefined values are passed.
-    // This is critical for preventing "Invalid nested entity" Firestore errors.
     const fileMetadataSafe = request.fileMetadata ? {
         name: request.fileMetadata.name || "unknown_file",
         mimeType: request.fileMetadata.mimeType || "application/octet-stream",
@@ -307,26 +431,94 @@ export class FirebaseService {
         const ref = await addDoc(collection(this.firestore, 'scan_requests'), docData);
         docId = ref.id;
     }
-
     setTimeout(() => this.triggerScanProcessor({ id: docId, ...docData }), 500);
     return docId;
   }
 
-  async approveAlert(alertId: string, decision: 'approved' | 'rejected'): Promise<void> {
+  async requestAdvancedReport(reportId: string): Promise<void> {
+      // AUTO-APPROVE LOGIC: Unlock immediately.
+      const updateData = { 
+          advancedRequestStatus: AccessRequestStatus.APPROVED,
+          reportTier: ReportTier.ADVANCED 
+      };
+      
+      const alertData = {
+          reportId,
+          severity: Severity.LOW, 
+          summary: 'Advanced Report Access Granted',
+          description: `User ${this.activeUser?.name} enabled advanced findings for audit ${reportId}. System auto-authorized access.`,
+          status: 'approved',
+          type: 'access_request',
+          created_at: new Date().toISOString(),
+          created_by: 'system',
+          approvedBy: 'System Auto-Auth',
+          approvedAt: new Date().toISOString()
+      };
+
+      if (this.isMock) {
+          const db = this.getMockDb();
+          const rIdx = db.agent_reports.findIndex(r => r.id === reportId);
+          if (rIdx !== -1) {
+              db.agent_reports[rIdx] = { ...db.agent_reports[rIdx], ...updateData };
+              db.alerts.push({ id: `req_${Date.now()}`, ...alertData });
+              this.saveMockDb(db);
+          }
+      } else {
+          await updateDoc(doc(this.firestore, 'agent_reports', reportId), updateData);
+          await addDoc(collection(this.firestore, 'alerts'), sanitizeData(alertData));
+      }
+  }
+
+  async requestVerification(reportId: string): Promise<void> {
+      const alertData = {
+          reportId,
+          severity: Severity.HIGH,
+          summary: 'Request for Human Verification',
+          description: `User ${this.activeUser?.name} requests expert review of findings for audit ${reportId}.`,
+          status: 'pending_approval',
+          type: 'verification',
+          created_at: new Date().toISOString(),
+          created_by: 'system'
+      };
+
+      if (this.isMock) {
+          const db = this.getMockDb();
+          db.alerts.push({ id: `ver_${Date.now()}`, ...alertData });
+          this.saveMockDb(db);
+      } else {
+          await addDoc(collection(this.firestore, 'alerts'), sanitizeData(alertData));
+      }
+  }
+
+  async approveAlert(alertId: string, decision: 'approved' | 'rejected', rejectionReason?: string): Promise<void> {
     const user = this.activeUser;
     const updateData = sanitizeData({ 
         status: decision, 
         approvedBy: user?.name || 'Officer', 
-        approvedAt: new Date().toISOString() 
+        approvedAt: new Date().toISOString(),
+        rejectionReason: rejectionReason || null 
     });
 
     if (this.isMock) {
         const db = this.getMockDb();
         const alertIdx = db.alerts.findIndex(a => a.id === alertId);
         if (alertIdx !== -1) {
-            db.alerts[alertIdx] = { ...db.alerts[alertIdx], ...updateData };
-            const reportIdx = db.agent_reports.findIndex(r => r.id === db.alerts[alertIdx].reportId);
-            if (reportIdx !== -1) db.agent_reports[reportIdx].isApproved = (decision === 'approved');
+            const alert = db.alerts[alertIdx];
+            db.alerts[alertIdx] = { ...alert, ...updateData };
+            
+            const reportIdx = db.agent_reports.findIndex(r => r.id === alert.reportId);
+            if (reportIdx !== -1) {
+                if (alert.type === 'access_request') {
+                    db.agent_reports[reportIdx].advancedRequestStatus = decision === 'approved' ? AccessRequestStatus.APPROVED : AccessRequestStatus.REJECTED;
+                    db.agent_reports[reportIdx].reportTier = decision === 'approved' ? ReportTier.ADVANCED : ReportTier.BASIC;
+                } else if (alert.type === 'verification') {
+                    db.agent_reports[reportIdx].reportTier = decision === 'approved' ? ReportTier.VERIFIED : db.agent_reports[reportIdx].reportTier;
+                    if (decision === 'approved') {
+                        db.agent_reports[reportIdx].verifiedBy = user?.name || 'Infosec Officer';
+                        db.agent_reports[reportIdx].verifiedAt = new Date().toISOString();
+                    }
+                }
+            }
             this.saveMockDb(db);
         }
     } else {
@@ -334,9 +526,21 @@ export class FirebaseService {
         const alertRef = doc(this.firestore, 'alerts', alertId);
         const alertSnap = await getDoc(alertRef);
         if (alertSnap.exists()) {
-            const rid = alertSnap.data().reportId;
+            const data = alertSnap.data();
+            const rid = data.reportId;
             if (rid) {
-                await setDoc(doc(this.firestore, 'agent_reports', rid), { isApproved: (decision === 'approved') }, { merge: true });
+                if (data.type === 'access_request') {
+                    await setDoc(doc(this.firestore, 'agent_reports', rid), { 
+                        advancedRequestStatus: decision === 'approved' ? AccessRequestStatus.APPROVED : AccessRequestStatus.REJECTED,
+                        reportTier: decision === 'approved' ? ReportTier.ADVANCED : ReportTier.BASIC
+                    }, { merge: true });
+                } else if (data.type === 'verification' && decision === 'approved') {
+                    await setDoc(doc(this.firestore, 'agent_reports', rid), { 
+                        reportTier: ReportTier.VERIFIED,
+                        verifiedBy: user?.name || 'Infosec Officer',
+                        verifiedAt: new Date().toISOString()
+                    }, { merge: true });
+                }
             }
         }
     }
@@ -344,7 +548,6 @@ export class FirebaseService {
 
   private async triggerScanProcessor(scanDoc: any) {
     try {
-      // Pass fileMetadata correctly
       const result = await runCentralBrainOrchestrator(
           scanDoc.agentType, 
           scanDoc.target, 
@@ -356,20 +559,18 @@ export class FirebaseService {
         scanRequestId: scanDoc.id, 
         created_at: new Date().toISOString(), 
         created_by: scanDoc.created_by,
-        isApproved: false 
+        reportTier: ReportTier.BASIC,
+        advancedRequestStatus: AccessRequestStatus.NONE
       });
 
-      // Special handling for Malware Agent requirement
-      // Stores detailed execution log in a separate collection as requested
       if (scanDoc.agentType === AgentType.MALWARE_ANALYSIS) {
           try {
-             // Create detailed payload matching requested structure
              const malwarePayload = {
                  analysis_id: scanDoc.id,
-                 ...result.report, // Includes findings (Static, Dynamic, etc.)
+                 ...result.report,
                  timestamp: new Date().toISOString(),
                  user_id: scanDoc.created_by,
-                 execution_time: '305s', // Simulated 5 min + overhead
+                 execution_time: '305s',
                  tool_usage_log: ['YARA', 'CAPEv2', 'Volatility', 'Suricata']
              };
 
@@ -379,8 +580,7 @@ export class FirebaseService {
                  db.malware_analysis.push(malwarePayload);
                  this.saveMockDb(db);
              } else {
-                 const malwareRef = collection(this.firestore, 'malware_analysis');
-                 await addDoc(malwareRef, sanitizeData(malwarePayload));
+                 await addDoc(collection(this.firestore, 'malware_analysis'), sanitizeData(malwarePayload));
              }
           } catch(e) { console.error("Malware collection write failed", e); }
       }
@@ -389,17 +589,11 @@ export class FirebaseService {
         const db = this.getMockDb();
         const reportId = `rep_${Date.now()}`;
         db.agent_reports.push({ id: reportId, ...reportData });
-        if (result.alert) {
-            db.alerts.push({ id: `alert_${Date.now()}`, ...result.alert, reportId, created_at: new Date().toISOString(), created_by: 'system' });
-        }
         const reqIdx = db.scan_requests.findIndex(s => s.id === scanDoc.id);
         if (reqIdx !== -1) db.scan_requests[reqIdx].status = 'completed';
         this.saveMockDb(db);
       } else {
-        const ref = await addDoc(collection(this.firestore, 'agent_reports'), reportData);
-        if (result.alert) {
-            await addDoc(collection(this.firestore, 'alerts'), sanitizeData({ ...result.alert, reportId: ref.id, created_at: new Date().toISOString(), created_by: 'system' }));
-        }
+        await addDoc(collection(this.firestore, 'agent_reports'), reportData);
         await setDoc(doc(this.firestore, 'scan_requests', scanDoc.id), { status: 'completed' }, { merge: true });
       }
     } catch (error: any) {
