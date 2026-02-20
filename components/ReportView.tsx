@@ -15,9 +15,12 @@ interface ReportViewProps {
 const ReportView: React.FC<ReportViewProps> = ({ report, alert, role, onBack, onApprove, onReject }) => {
   const [requestingAccess, setRequestingAccess] = useState(false);
   const [requestingVerification, setRequestingVerification] = useState(false);
+  const [showQueryForm, setShowQueryForm] = useState(false);
+  const [queryText, setQueryText] = useState("");
+  const [submittingQuery, setSubmittingQuery] = useState(false);
+  const [querySent, setQuerySent] = useState(false);
   
   // OPTIMISTIC UI STATE
-  // These override the props temporarily to provide "instant" feedback
   const [optimisticTier, setOptimisticTier] = useState<ReportTier | null>(null);
   const [optimisticVerification, setOptimisticVerification] = useState<string | null>(null);
 
@@ -39,27 +42,26 @@ const ReportView: React.FC<ReportViewProps> = ({ report, alert, role, onBack, on
 
   const handleRequestAdvanced = async () => {
     setRequestingAccess(true);
-    
-    // 1. INSTANTLY update UI to show Advanced content
     setOptimisticTier(ReportTier.ADVANCED);
-    
-    // 2. Perform DB update in background
     await db.requestAdvancedReport(report.id as string);
-    
-    // 3. Reset loading spinner (content stays visible via optimisticTier)
     setTimeout(() => setRequestingAccess(false), 500);
   };
 
   const handleRequestVerify = async () => {
     setRequestingVerification(true);
-    
-    // 1. INSTANTLY update UI to show Pending status
     setOptimisticVerification('pending_approval');
-    
-    // 2. Perform DB update
     await db.requestVerification(report.id as string);
-    
     setRequestingVerification(false);
+  };
+
+  const handleSubmitQuery = async () => {
+      if (!queryText.trim()) return;
+      setSubmittingQuery(true);
+      await db.submitReportQuery(report.id as string, queryText);
+      setSubmittingQuery(false);
+      setQuerySent(true);
+      setShowQueryForm(false);
+      setQueryText("");
   };
 
   const handleDownloadPDF = () => {
@@ -395,52 +397,103 @@ const ReportView: React.FC<ReportViewProps> = ({ report, alert, role, onBack, on
                                 </div>
                             </div>
                         ) : (
-                            /* Verification Request moved to bottom of content */
-                            <div className="mt-12 py-10 px-6 border-t border-slate-200 bg-slate-50/50 rounded-xl flex flex-col items-center text-center">
-                                <h4 className="text-lg font-black text-indira-navy uppercase tracking-tight mb-2">Official Certification Required?</h4>
-                                <p className="text-xs text-slate-500 mb-6 max-w-lg leading-relaxed">
-                                    If this report is needed for official university compliance, grant applications, or external audits, 
-                                    you may request a formal review by the Information Security Department.
-                                </p>
+                            /* DUAL ACTION FOOTER: Certification & Support */
+                            <div className="mt-16 grid grid-cols-1 md:grid-cols-2 gap-8 border-t border-slate-200 pt-12">
                                 
-                                {verificationStatus === 'pending_approval' ? (
-                                    <div className="bg-amber-100 text-amber-800 px-6 py-3 rounded-lg font-black uppercase text-xs tracking-widest border border-amber-200 flex items-center gap-2 animate-in fade-in zoom-in">
-                                        <div className="w-2 h-2 bg-amber-600 rounded-full animate-pulse"></div>
-                                        Verification Pending Officer Review
-                                    </div>
-                                ) : verificationStatus === 'rejected' ? (
-                                    <div className="bg-red-50 text-red-700 px-8 py-4 rounded-xl font-black uppercase text-xs tracking-widest border-2 border-red-200 flex flex-col items-center gap-2 shadow-sm animate-in shake duration-500 max-w-xl">
-                                        <div className="flex items-center gap-2 mb-2">
-                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                            <span className="text-sm font-black">Verification Request Denied</span>
+                                {/* LEFT: OFFICIAL CERTIFICATION */}
+                                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-6 md:p-8 flex flex-col items-center text-center shadow-sm hover:shadow-md transition-all">
+                                    <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-2xl shadow-sm mb-4 border border-slate-100">🎖️</div>
+                                    <h4 className="text-sm font-black text-indira-navy uppercase tracking-tight mb-2">Official Certification</h4>
+                                    <p className="text-[10px] md:text-xs text-slate-500 mb-6 leading-relaxed max-w-sm">
+                                        Need this report for compliance, grants, or external audits? Request a formal review to receive a signed verification seal.
+                                    </p>
+                                    
+                                    {verificationStatus === 'pending_approval' ? (
+                                        <div className="bg-amber-100 text-amber-800 px-6 py-3 rounded-lg font-black uppercase text-[9px] tracking-widest border border-amber-200 flex items-center gap-2 w-full justify-center">
+                                            <div className="w-2 h-2 bg-amber-600 rounded-full animate-pulse"></div>
+                                            Review Pending
                                         </div>
-                                        <span className="text-[9px] opacity-70 font-bold block mb-3">Infosec Rejected This Certification Request</span>
-                                        
-                                        {alert?.rejectionReason && (
-                                            <div className="w-full bg-white/60 p-3 rounded-lg text-left border border-red-100">
-                                                <span className="text-[7px] text-red-900 font-black uppercase tracking-widest block mb-1">Officer Note:</span>
-                                                <p className="text-[10px] md:text-xs font-medium leading-relaxed italic">
+                                    ) : verificationStatus === 'rejected' ? (
+                                        <div className="bg-red-50 text-red-700 px-6 py-4 rounded-xl font-black uppercase text-[9px] tracking-widest border border-red-200 w-full text-center">
+                                             Verification Denied
+                                             {alert?.rejectionReason && (
+                                                <span className="block mt-1 font-medium normal-case italic opacity-80">
                                                     "{alert.rejectionReason}"
-                                                </p>
+                                                </span>
+                                             )}
+                                        </div>
+                                    ) : (
+                                        <button 
+                                            onClick={handleRequestVerify}
+                                            disabled={requestingVerification}
+                                            className="w-full bg-indira-navy text-white px-6 py-3 rounded-xl font-black uppercase text-[9px] tracking-[0.2em] hover:bg-indira-brand shadow-lg transition-all active:scale-95 disabled:opacity-70"
+                                        >
+                                            {requestingVerification ? 'Submitting...' : 'Request Seal'}
+                                        </button>
+                                    )}
+                                </div>
+
+                                {/* RIGHT: QUERY & SUPPORT CENTER */}
+                                <div className="bg-white border-2 border-slate-100 rounded-2xl p-6 md:p-8 flex flex-col items-center text-center shadow-sm hover:border-indira-brand/30 transition-all relative overflow-hidden">
+                                     <div className="absolute top-0 left-0 w-full h-1 bg-indira-gold"></div>
+                                     <div className="w-12 h-12 bg-indira-subtle rounded-full flex items-center justify-center text-2xl shadow-sm mb-4 text-indira-brand">💬</div>
+                                     <h4 className="text-sm font-black text-indira-navy uppercase tracking-tight mb-2">InfoSec Support Center</h4>
+                                     
+                                     {!showQueryForm && !querySent ? (
+                                         <>
+                                            <p className="text-[10px] md:text-xs text-slate-500 mb-6 leading-relaxed max-w-sm">
+                                                Have questions about specific findings? Contact the Cyber Defense team directly for clarification or assistance.
+                                            </p>
+                                            <button 
+                                                onClick={() => setShowQueryForm(true)}
+                                                className="w-full bg-white border-2 border-indira-border text-indira-navy px-6 py-3 rounded-xl font-black uppercase text-[9px] tracking-[0.2em] hover:bg-indira-subtle hover:border-indira-navy transition-all active:scale-95"
+                                            >
+                                                Open Support Ticket
+                                            </button>
+                                            <div className="mt-4 pt-4 border-t border-slate-100 w-full">
+                                                <p className="text-[8px] font-black uppercase text-slate-400 tracking-widest mb-1">Direct Contact</p>
+                                                <p className="text-[10px] font-bold text-indira-navy">Dr. Aditi Rao (CISO) &bull; ext. 4040</p>
+                                                <p className="text-[10px] font-mono text-slate-500">infosec@indira.edu</p>
                                             </div>
-                                        )}
-                                    </div>
-                                ) : (
-                                    <button 
-                                        onClick={handleRequestVerify}
-                                        disabled={requestingVerification}
-                                        className="bg-emerald-600 text-white px-8 py-3 rounded-xl font-black uppercase text-[10px] tracking-[0.2em] hover:bg-emerald-700 shadow-lg hover:shadow-emerald-500/20 transition-all active:scale-95 disabled:opacity-70 flex items-center gap-2"
-                                    >
-                                        {requestingVerification ? (
-                                            <>Processing Request...</>
-                                        ) : (
-                                            <>
-                                                Request Human Verification
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                            </>
-                                        )}
-                                    </button>
-                                )}
+                                         </>
+                                     ) : querySent ? (
+                                         <div className="flex-1 flex flex-col items-center justify-center animate-in zoom-in">
+                                             <div className="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mb-3">
+                                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>
+                                             </div>
+                                             <h5 className="text-xs font-black uppercase text-emerald-700 mb-1">Ticket Submitted</h5>
+                                             <p className="text-[10px] text-slate-500">The InfoSec team will review your query shortly.</p>
+                                             <button onClick={() => setQuerySent(false)} className="mt-4 text-[9px] font-bold underline text-slate-400 hover:text-indira-navy">Send another query</button>
+                                         </div>
+                                     ) : (
+                                         <div className="w-full text-left animate-in fade-in slide-in-from-bottom-2">
+                                             <label className="block text-[8px] font-black uppercase text-slate-400 tracking-widest mb-2">Describe your issue</label>
+                                             <textarea 
+                                                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs font-medium text-slate-700 outline-none focus:border-indira-brand focus:ring-1 focus:ring-indira-brand mb-3 resize-none"
+                                                rows={3}
+                                                placeholder="e.g. I believe finding #3 is a false positive because..."
+                                                value={queryText}
+                                                onChange={(e) => setQueryText(e.target.value)}
+                                                autoFocus
+                                             />
+                                             <div className="flex gap-2">
+                                                 <button 
+                                                    onClick={() => setShowQueryForm(false)}
+                                                    className="flex-1 py-2 text-[9px] font-black uppercase text-slate-400 hover:text-slate-600"
+                                                 >
+                                                     Cancel
+                                                 </button>
+                                                 <button 
+                                                    onClick={handleSubmitQuery}
+                                                    disabled={submittingQuery}
+                                                    className="flex-1 bg-indira-brand text-white py-2 rounded-lg font-black uppercase text-[9px] tracking-wide hover:bg-indira-navy shadow-md disabled:opacity-70"
+                                                 >
+                                                     {submittingQuery ? 'Sending...' : 'Submit Ticket'}
+                                                 </button>
+                                             </div>
+                                         </div>
+                                     )}
+                                </div>
                             </div>
                         )}
                     </div>

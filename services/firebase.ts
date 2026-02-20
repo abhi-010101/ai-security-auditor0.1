@@ -2,7 +2,7 @@
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, query, where, limit, setDoc, getDoc, deleteDoc, onSnapshot, writeBatch } from 'firebase/firestore';
 import { getAuth, sendPasswordResetEmail } from 'firebase/auth';
-import { AgentType, Severity, UserRole, User, UserStatus, Alert, AgentReport, ReportTier, AccessRequestStatus } from '../types';
+import { AgentType, Severity, UserRole, User, UserStatus, Alert, AgentReport, ReportTier, AccessRequestStatus, ChatMessage, TicketCategory } from '../types';
 import { runCentralBrainOrchestrator } from './geminiService';
 
 const firebaseConfig = {
@@ -68,7 +68,13 @@ export class FirebaseService {
   
   private getMockDb(): Record<string, any[]> {
     const stored = localStorage.getItem('uniguard_db');
-    if (stored) return JSON.parse(stored);
+    if (stored) {
+      try {
+        return JSON.parse(stored);
+      } catch (e) {
+        console.error("Failed to parse DB, resetting");
+      }
+    }
     
     return {
       users: [
@@ -291,8 +297,9 @@ export class FirebaseService {
       const poll = () => {
         let raw = this.getMockDb().alerts;
         if (role === UserRole.USER) {
+            // Users see alerts related to their reports OR support tickets they created
             const myReports = this.getMockDb().agent_reports.filter(r => r.created_by === this.activeUser?.uid).map(r => r.id);
-            raw = raw.filter(a => myReports.includes(a.reportId));
+            raw = raw.filter(a => myReports.includes(a.reportId) || a.created_by === this.activeUser?.uid);
         }
         callback(raw);
       };
@@ -306,7 +313,8 @@ export class FirebaseService {
           const myReportsPromise = this.getReports(UserRole.USER);
           myReportsPromise.then(r => {
              const ids = r.map(x => x.id);
-             callback(alerts.filter(a => ids.includes(a.reportId)));
+             // Return alerts for my reports OR alerts I created (support tickets)
+             callback(alerts.filter(a => (a.reportId && ids.includes(a.reportId)) || a.created_by === this.activeUser?.uid));
           });
       } else {
           callback(alerts.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()));
@@ -377,7 +385,7 @@ export class FirebaseService {
       const reportIdsToDelete = db.agent_reports.filter(r => r.created_by === uid).map(r => r.id);
       db.agent_reports = db.agent_reports.filter(r => r.created_by !== uid);
       db.scan_requests = db.scan_requests.filter(s => s.created_by !== uid);
-      db.alerts = db.alerts.filter(a => !reportIdsToDelete.includes(a.reportId));
+      db.alerts = db.alerts.filter(a => !reportIdsToDelete.includes(a.reportId) && a.created_by !== uid);
       if (db.malware_analysis) db.malware_analysis = db.malware_analysis.filter(m => m.user_id !== uid);
       this.saveMockDb(db);
     } else {
@@ -399,6 +407,11 @@ export class FirebaseService {
               snap.forEach(d => batch.delete(d.ref));
           }
       }
+      // Also delete any alerts created by user (support tickets)
+      const ticketQ = query(collection(this.firestore, 'alerts'), where('created_by', '==', uid));
+      const ticketSnap = await getDocs(ticketQ);
+      ticketSnap.forEach(d => batch.delete(d.ref));
+
       await batch.commit();
     }
   }
@@ -435,6 +448,154 @@ export class FirebaseService {
     return docId;
   }
 
+  // --- SUPPORT TICKET & CHAT LOGIC ---
+
+  private calculateRiskLevel(text: string, category: TicketCategory): Severity {
+      // Deterministic "AI" Risk Scoring based on keywords
+      const criticalKeywords = ['ransom', 'encrypted', 'hack', 'breach', 'exfil', 'leak', 'root', 'admin'];
+      const highKeywords = ['password', 'credential', 'access', 'lock', 'phish', 'suspicious'];
+      const mediumKeywords = ['slow', 'error', 'fail', 'connect', 'wifi', 'vpn'];
+      
+      const lowerText = text.toLowerCase();
+      
+      if (criticalKeywords.some(k => lowerText.includes(k))) return Severity.CRITICAL;
+      if (category === TicketCategory.MALWARE || category === TicketCategory.DATA_LEAK) return Severity.HIGH;
+      if (highKeywords.some(k => lowerText.includes(k))) return Severity.HIGH;
+      if (mediumKeywords.some(k => lowerText.includes(k))) return Severity.MEDIUM;
+      
+      return Severity.LOW;
+  }
+
+  async createSupportToken(data: { category: TicketCategory, description: string }): Promise<string> {
+      const year = new Date().getFullYear();
+      const randomId = Math.floor(1000 + Math.random() * 9000);
+      const ticketId = `INF-CHAT-${year}-${randomId}`;
+      const riskLevel = this.calculateRiskLevel(data.description, data.category);
+      
+      const alertData: Alert = {
+          severity: riskLevel,
+          summary: data.category,
+          description: data.description,
+          status: 'pending_approval',
+          type: 'support_ticket',
+          ticketId: ticketId,
+          ticketCategory: data.category,
+          created_at: new Date().toISOString(),
+          created_by: this.activeUser?.uid || 'system',
+          messages: []
+      };
+
+      let docRefId;
+      if (this.isMock) {
+          docRefId = `tkt_${Date.now()}`;
+          const db = this.getMockDb();
+          db.alerts.push({ id: docRefId, ...alertData });
+          this.saveMockDb(db);
+      } else {
+          const ref = await addDoc(collection(this.firestore, 'alerts'), sanitizeData(alertData));
+          docRefId = ref.id;
+      }
+      return docRefId;
+  }
+
+  async updateTicketStatus(ticketId: string, status: 'active' | 'rejected' | 'resolved' | 'closed', reason?: string): Promise<void> {
+      const updateData: any = { status };
+      
+      if (status === 'active') {
+          updateData.approvedBy = this.activeUser?.name;
+          updateData.approvedAt = new Date().toISOString();
+          // Add system message
+          const sysMsg: ChatMessage = {
+              id: `sys_${Date.now()}`,
+              senderId: 'system',
+              senderName: 'System',
+              senderRole: UserRole.INFOSEC,
+              text: `TOKEN ${status === 'active' ? 'APPROVED' : 'UPDATED'}. Secure channel established. Encryption active.`,
+              timestamp: new Date().toISOString(),
+              isSystemMessage: true
+          };
+          // Need to fetch existing messages to append if not using arrayUnion (mock simplicity)
+          // Handled in mock logic below, for real logic assuming setDoc merge or array update
+      } else if (status === 'rejected') {
+          updateData.rejectionReason = reason;
+      } else if (status === 'resolved' || status === 'closed') {
+          updateData.closedAt = new Date().toISOString();
+          updateData.closedBy = this.activeUser?.name;
+          updateData.resolutionSummary = reason; // reusing reason param for summary
+      }
+
+      if (this.isMock) {
+          const db = this.getMockDb();
+          const idx = db.alerts.findIndex(a => a.id === ticketId);
+          if (idx !== -1) {
+              const prev = db.alerts[idx];
+              let newMsgs = prev.messages || [];
+              if (status === 'active') {
+                   newMsgs.push({
+                      id: `sys_${Date.now()}`,
+                      senderId: 'system',
+                      senderName: 'System',
+                      senderRole: UserRole.INFOSEC,
+                      text: `TOKEN APPROVED. Secure channel established. Encryption active.`,
+                      timestamp: new Date().toISOString(),
+                      isSystemMessage: true
+                  });
+              }
+              db.alerts[idx] = { ...prev, ...updateData, messages: newMsgs };
+              this.saveMockDb(db);
+          }
+      } else {
+          // For real Firestore, we would use arrayUnion for messages, but for simplicity of this generic class:
+          await updateDoc(doc(this.firestore, 'alerts', ticketId), sanitizeData(updateData));
+      }
+  }
+
+  async submitTicketRating(ticketId: string, rating: number): Promise<void> {
+      if (this.isMock) {
+          const db = this.getMockDb();
+          const idx = db.alerts.findIndex(a => a.id === ticketId);
+          if (idx !== -1) {
+              db.alerts[idx].rating = rating;
+              this.saveMockDb(db);
+          }
+      } else {
+          await updateDoc(doc(this.firestore, 'alerts', ticketId), { rating });
+      }
+  }
+
+  async sendChatMessage(alertId: string, text: string, attachment?: any): Promise<void> {
+      const newMessage: ChatMessage = {
+          id: `msg_${Date.now()}`,
+          senderId: this.activeUser?.uid || 'system',
+          senderName: this.activeUser?.name || 'Support Agent',
+          senderRole: this.activeUser?.role || UserRole.INFOSEC,
+          text: text,
+          timestamp: new Date().toISOString(),
+          attachment: attachment || undefined
+      };
+
+      if (this.isMock) {
+          const db = this.getMockDb();
+          const alertIdx = db.alerts.findIndex(a => a.id === alertId);
+          if (alertIdx !== -1) {
+              const alert = db.alerts[alertIdx];
+              const messages = alert.messages || [];
+              db.alerts[alertIdx] = { ...alert, messages: [...messages, newMessage] };
+              this.saveMockDb(db);
+          }
+      } else {
+          const alertRef = doc(this.firestore, 'alerts', alertId);
+          const alertSnap = await getDoc(alertRef);
+          if (alertSnap.exists()) {
+              const data = alertSnap.data();
+              const messages = data.messages || [];
+              await updateDoc(alertRef, { messages: [...messages, newMessage] });
+          }
+      }
+  }
+
+  // --- EXISTING LOGIC ---
+
   async requestAdvancedReport(reportId: string): Promise<void> {
       // AUTO-APPROVE LOGIC: Unlock immediately.
       const updateData = { 
@@ -450,7 +611,7 @@ export class FirebaseService {
           status: 'approved',
           type: 'access_request',
           created_at: new Date().toISOString(),
-          created_by: 'system',
+          created_by: this.activeUser?.uid || 'system', // ATTRIBUTED TO USER
           approvedBy: 'System Auto-Auth',
           approvedAt: new Date().toISOString()
       };
@@ -478,7 +639,7 @@ export class FirebaseService {
           status: 'pending_approval',
           type: 'verification',
           created_at: new Date().toISOString(),
-          created_by: 'system'
+          created_by: this.activeUser?.uid || 'system' // ATTRIBUTED TO USER
       };
 
       if (this.isMock) {
@@ -490,7 +651,39 @@ export class FirebaseService {
       }
   }
 
-  async approveAlert(alertId: string, decision: 'approved' | 'rejected', rejectionReason?: string): Promise<void> {
+  async submitReportQuery(reportId: string, queryText: string): Promise<void> {
+      // Create initial message
+      const initialMessage: ChatMessage = {
+          id: `msg_${Date.now()}`,
+          senderId: this.activeUser?.uid || 'anon',
+          senderName: this.activeUser?.name || 'User',
+          senderRole: this.activeUser?.role || UserRole.USER,
+          text: queryText,
+          timestamp: new Date().toISOString()
+      };
+
+      const alertData = {
+          reportId,
+          severity: Severity.MEDIUM,
+          summary: 'User Inquiry / Support Ticket',
+          description: queryText,
+          status: 'pending_approval', // Open ticket
+          type: 'query',
+          created_at: new Date().toISOString(),
+          created_by: this.activeUser?.uid || 'system',
+          messages: [initialMessage]
+      };
+
+      if (this.isMock) {
+          const db = this.getMockDb();
+          db.alerts.push({ id: `ticket_${Date.now()}`, ...alertData });
+          this.saveMockDb(db);
+      } else {
+          await addDoc(collection(this.firestore, 'alerts'), sanitizeData(alertData));
+      }
+  }
+
+  async approveAlert(alertId: string, decision: 'approved' | 'rejected' | 'resolved', rejectionReason?: string): Promise<void> {
     const user = this.activeUser;
     const updateData = sanitizeData({ 
         status: decision, 

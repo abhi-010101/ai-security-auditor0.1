@@ -38,6 +38,15 @@ export enum AccessRequestStatus {
   REJECTED = 'rejected'
 }
 
+export enum TicketCategory {
+  MALWARE = 'Malware Infection',
+  PHISHING = 'Phishing Attempt',
+  ACCESS = 'Access / Login Issue',
+  DATA_LEAK = 'Data Leakage',
+  SYSTEM_ALERT = 'System Alert',
+  OTHER = 'Other Inquiry'
+}
+
 export interface FirestoreDocument {
   id?: string;
   created_at: string;
@@ -94,16 +103,46 @@ export interface AgentReport extends FirestoreDocument {
   compoundThreat?: boolean;
 }
 
+export interface ChatAttachment {
+  name: string;
+  type: string;
+  size: number;
+  data: string; // Base64
+}
+
+export interface ChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  senderRole: UserRole;
+  text: string;
+  timestamp: string;
+  attachment?: ChatAttachment;
+  isSystemMessage?: boolean;
+}
+
 export interface Alert extends FirestoreDocument {
-  reportId: string;
+  reportId?: string;
   severity: Severity;
   summary: string;
   description: string;
-  status: 'pending_approval' | 'approved' | 'rejected';
-  type: 'verification' | 'access_request'; // Distinguish between verifying report and asking for detailed view
+  status: 'pending_approval' | 'active' | 'approved' | 'rejected' | 'resolved' | 'closed'; // Extended status
+  type: 'verification' | 'access_request' | 'query' | 'support_ticket'; 
+  
+  // Ticket Specifics
+  ticketId?: string; // Human readable INF-CHAT-XXXX
+  ticketCategory?: TicketCategory;
+  messages?: ChatMessage[];
+  
   approvedBy?: string;
   approvedAt?: string;
-  rejectionReason?: string; // Optional feedback note when rejected
+  rejectionReason?: string;
+  
+  // Resolution Metrics
+  resolutionSummary?: string;
+  rating?: number; // 1-5
+  closedAt?: string;
+  closedBy?: string;
 }
 
 export interface CorrelationReport {
